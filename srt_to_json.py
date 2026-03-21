@@ -126,7 +126,6 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1:
         input_srt = sys.argv[1]
-        
         # macOS drag-and-drop bug workaround for iCloud paths
         if "comappleCloudDocs" in input_srt:
             input_srt = input_srt.replace("comappleCloudDocs", "com~apple~CloudDocs")
