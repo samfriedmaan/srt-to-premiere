@@ -132,13 +132,11 @@ if __name__ == "__main__":
 
     output_json = os.path.splitext(input_srt)[0] + ".json"
         
-    try:
-        with open(output_json, 'w', encoding='utf-8') as f:
-            json.dump(premiere_json, f, indent=None, separators=(',', ':'))
-        print(f"Done. Saved to {output_json}")
-    except PermissionError:
-        fallback_json = os.path.basename(output_json)
-        print(f"Warning: Permission denied for {output_json}. Saving to current directory as {fallback_json}")
-        with open(fallback_json, 'w', encoding='utf-8') as f:
-            json.dump(premiere_json, f, indent=None, separators=(',', ':'))
-        print(f"Done. Saved to {fallback_json}")
+    print(f"Converting {input_srt} to {output_json}...")
+    srt_entries = parse_srt(input_srt)
+    premiere_json = convert_to_premiere_json(srt_entries)
+    
+    with open(output_json, 'w', encoding='utf-8') as f:
+        json.dump(premiere_json, f, indent=None, separators=(',', ':'))
+    
+    print("Done.")

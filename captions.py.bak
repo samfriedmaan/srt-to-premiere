@@ -85,16 +85,8 @@ def write_premiere_json(segments, speaker_id, premiere_language, output_path):
         "segments": segments,
         "speakers": [{"id": speaker_id, "name": "Speaker 1"}],
     }
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, separators=(",", ":"))
-        return output_path
-    except PermissionError:
-        fallback_path = os.path.basename(output_path)
-        print(f"Warning: Permission denied for {output_path}. Saving to current directory as {fallback_path}")
-        with open(fallback_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, separators=(",", ":"))
-        return fallback_path
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +99,8 @@ def cmd_transcribe(args):
     parser.add_argument("audio", help="Path to MP3 (or any audio) file")
     parser.add_argument("--language", default="de", help="Whisper language code (default: de)")
     parser.add_argument("--model", default="large-v3-turbo", help="Whisper model name (default: large-v3-turbo)")
-    parser.add_argument("--compute-type", default="float32", dest="compute_type",
-                        help="Whisper compute type (default: float32 for stability on Mac)")
     parser.add_argument("--premiere-language", default="en-us", dest="premiere_language",
                         help="Language tag written into Premiere JSON (default: en-us)")
-    parser.add_argument("-o", "--output", help="Optional output path for the JSON/TXT (defaults to same folder as audio)")
     opts = parser.parse_args(args)
 
     try:
@@ -122,14 +111,11 @@ def cmd_transcribe(args):
 
     audio_path = fix_icloud_path(opts.audio)
     base = os.path.splitext(audio_path)[0]
-    json_path = opts.output if opts.output and opts.output.lower().endswith(".json") else base + ".json"
-    txt_path = opts.output.replace(".json", "_client.txt") if opts.output and opts.output.lower().endswith(".json") else base + "_client.txt"
-    if opts.output and not opts.output.lower().endswith(".json"):
-        json_path = os.path.join(opts.output, os.path.basename(base) + ".json")
-        txt_path = os.path.join(opts.output, os.path.basename(base) + "_client.txt")
+    json_path = base + ".json"
+    txt_path = base + "_client.txt"
 
-    print(f"Loading model '{opts.model}' (compute_type={opts.compute_type}) …")
-    model = WhisperModel(opts.model, device="auto", compute_type=opts.compute_type)
+    print(f"Loading model '{opts.model}' …")
+    model = WhisperModel(opts.model, device="auto", compute_type="auto")
 
     print(f"Transcribing {audio_path}  (language={opts.language}) …")
     segments_iter, _info = model.transcribe(
@@ -165,8 +151,8 @@ def cmd_transcribe(args):
 
     # Write Premiere JSON
     segments = words_to_segments(all_words, speaker_id, opts.premiere_language)
-    saved_json = write_premiere_json(segments, speaker_id, opts.premiere_language, json_path)
-    print(f"Wrote {saved_json}  ({len(all_words)} words, {len(segments)} segments)")
+    write_premiere_json(segments, speaker_id, opts.premiere_language, json_path)
+    print(f"Wrote {json_path}  ({len(all_words)} words, {len(segments)} segments)")
 
     # Write client TXT
     lines = []
@@ -174,16 +160,9 @@ def cmd_transcribe(args):
         lines.append(f"[{ts}]")
         lines.append(" ".join(words))
         lines.append("")
-        
-    try:
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines).rstrip() + "\n")
-        print(f"Wrote {txt_path}")
-    except PermissionError:
-        fallback_txt = os.path.basename(txt_path)
-        print(f"Warning: Permission denied for {txt_path}. Saving to current directory as {fallback_txt}")
-        with open(fallback_txt, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines).rstrip() + "\n")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).rstrip() + "\n")
+    print(f"Wrote {txt_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +262,10 @@ def cmd_from_srt(args):
     import argparse
     parser = argparse.ArgumentParser(prog="captions.py from-srt")
     parser.add_argument("srt_file", help="Path to SRT file")
-    parser.add_argument("-o", "--output", help="Optional output path for the JSON (defaults to same folder as SRT)")
     opts = parser.parse_args(args)
 
     srt_path = fix_icloud_path(opts.srt_file)
-    output_path = opts.output if opts.output else os.path.splitext(srt_path)[0] + ".json"
+    output_path = os.path.splitext(srt_path)[0] + ".json"
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from srt_to_json import parse_srt, convert_to_premiere_json
@@ -295,17 +273,9 @@ def cmd_from_srt(args):
     print(f"Converting {srt_path} → {output_path} …")
     srt_entries = parse_srt(srt_path)
     premiere_json = convert_to_premiere_json(srt_entries)
-    
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(premiere_json, f, separators=(",", ":"))
-        print(f"Done. Saved to {output_path}")
-    except PermissionError:
-        fallback_path = os.path.basename(output_path)
-        print(f"Warning: Permission denied for {output_path}. Saving to current directory as {fallback_path}")
-        with open(fallback_path, "w", encoding="utf-8") as f:
-            json.dump(premiere_json, f, separators=(",", ":"))
-        print(f"Done. Saved to {fallback_path}")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(premiere_json, f, separators=(",", ":"))
+    print("Done.")
 
 
 # ---------------------------------------------------------------------------
