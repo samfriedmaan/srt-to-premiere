@@ -122,8 +122,10 @@ def cmd_transcribe(args):
 
     audio_path = fix_icloud_path(opts.audio)
     base = os.path.splitext(audio_path)[0]
+    
+    # Initial target paths
     json_path = opts.output if opts.output and opts.output.lower().endswith(".json") else base + ".json"
-    txt_path = opts.output.replace(".json", "_client.txt") if opts.output and opts.output.lower().endswith(".json") else base + "_client.txt"
+    txt_path = json_path.replace(".json", "_client.txt") if json_path.endswith(".json") else base + "_client.txt"
     if opts.output and not opts.output.lower().endswith(".json"):
         json_path = os.path.join(opts.output, os.path.basename(base) + ".json")
         txt_path = os.path.join(opts.output, os.path.basename(base) + "_client.txt")
@@ -165,25 +167,39 @@ def cmd_transcribe(args):
 
     # Write Premiere JSON
     segments = words_to_segments(all_words, speaker_id, opts.premiere_language)
-    saved_json = write_premiere_json(segments, speaker_id, opts.premiere_language, json_path)
-    print(f"Wrote {saved_json}  ({len(all_words)} words, {len(segments)} segments)")
-
-    # Write client TXT
-    lines = []
-    for ts, words in txt_blocks:
-        lines.append(f"[{ts}]")
-        lines.append(" ".join(words))
-        lines.append("")
-        
+    
+    data = {
+        "language": opts.premiere_language,
+        "segments": segments,
+        "speakers": [{"id": speaker_id, "name": "Speaker 1"}],
+    }
+    
+    # Try writing JSON first to determine the target directory
     try:
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines).rstrip() + "\n")
-        print(f"Wrote {txt_path}")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+        final_json_path = json_path
+        final_txt_path = txt_path
     except PermissionError:
-        fallback_txt = os.path.basename(txt_path)
-        print(f"Warning: Permission denied for {txt_path}. Saving to current directory as {fallback_txt}")
-        with open(fallback_txt, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines).rstrip() + "\n")
+        final_json_path = os.path.basename(json_path)
+        final_txt_path = os.path.basename(txt_path)
+        print(f"Warning: Permission denied for {json_path}. Saving BOTH files to current directory.")
+        with open(final_json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+
+    print(f"Wrote {final_json_path}  ({len(all_words)} words, {len(segments)} segments)")
+
+    # Prepare client TXT lines
+    txt_lines = []
+    for ts, words in txt_blocks:
+        txt_lines.append(f"[{ts}]")
+        txt_lines.append(" ".join(words))
+        txt_lines.append("")
+        
+    # Write client TXT to the SAME final location
+    with open(final_txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(txt_lines).rstrip() + "\n")
+    print(f"Wrote {final_txt_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +315,14 @@ def cmd_from_srt(args):
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(premiere_json, f, separators=(",", ":"))
-        print(f"Done. Saved to {output_path}")
+        final_path = output_path
     except PermissionError:
-        fallback_path = os.path.basename(output_path)
-        print(f"Warning: Permission denied for {output_path}. Saving to current directory as {fallback_path}")
-        with open(fallback_path, "w", encoding="utf-8") as f:
+        final_path = os.path.basename(output_path)
+        print(f"Warning: Permission denied for {output_path}. Saving to current directory.")
+        with open(final_path, "w", encoding="utf-8") as f:
             json.dump(premiere_json, f, separators=(",", ":"))
-        print(f"Done. Saved to {fallback_path}")
+            
+    print(f"Done. Saved to {final_path}")
 
 
 # ---------------------------------------------------------------------------
