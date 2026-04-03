@@ -112,12 +112,15 @@ def cmd_transcribe(args):
     parser.add_argument("--premiere-language", default="en-us", dest="premiere_language",
                         help="Language tag written into Premiere JSON (default: en-us)")
     parser.add_argument("-o", "--output", help="Optional output path for the JSON/TXT (defaults to same folder as audio)")
+    parser.add_argument("--timestamp-interval", type=float, default=60.0, dest="timestamp_interval",
+                        help="Frequency of timestamps in the TXT file (default: every 60 seconds)")
     opts = parser.parse_args(args)
 
     try:
         from faster_whisper import WhisperModel
+        from tqdm import tqdm
     except ImportError:
-        print("faster-whisper is not installed. Run:  pip install faster-whisper")
+        print("Required libraries missing. Run:  pip install faster-whisper tqdm")
         sys.exit(1)
 
     audio_path = fix_icloud_path(opts.audio)
@@ -142,24 +145,46 @@ def cmd_transcribe(args):
 
     speaker_id = str(uuid.uuid4())
     all_words = []
-    txt_blocks = []  # list of (timestamp_str, words_in_segment)
+    txt_blocks = []  # list of (timestamp_str, list_of_words)
+    
+    last_ts_time = -9999.0  # Force first block to have a timestamp
+    current_block_words = []
 
-    for seg in segments_iter:
-        raw_words = list(seg.words)
-        if not raw_words:
-            continue
-
-        seg_words = []
-        for w in raw_words:
-            text = w.word.strip()
-            if not text:
+    with tqdm(total=round(_info.duration, 2), unit="sec", desc="Transcribing") as pbar:
+        for seg in segments_iter:
+            raw_words = list(seg.words)
+            if not raw_words:
                 continue
-            duration = w.end - w.start
-            word_obj = make_word_obj(text, w.start, duration, confidence=w.probability)
-            all_words.append(word_obj)
-            seg_words.append(text)
 
-        txt_blocks.append((seconds_to_hms(seg.start), seg_words))
+            for w in raw_words:
+                text = w.word.strip()
+                if not text:
+                    continue
+                word_obj = make_word_obj(text, w.start, w.end - w.start, confidence=w.probability)
+                all_words.append(word_obj)
+                current_block_words.append(text)
+
+            # Grouping for minimal TXT timestamps
+            if seg.start - last_ts_time >= opts.timestamp_interval:
+                if current_block_words:
+                    txt_blocks.append((seconds_to_hms(seg.start), current_block_words))
+                    current_block_words = []
+                else:
+                    # If empty but need a start time for the first block
+                    pass
+                last_ts_time = seg.start
+            
+            pbar.update(round(seg.end - pbar.n, 2))
+
+    # Catch remaining words for the last block
+    if current_block_words:
+        # If the first block hasn't been added yet
+        ts = txt_blocks[-1][0] if txt_blocks else "0:00:00"
+        if not txt_blocks:
+             txt_blocks.append(("0:00:00", current_block_words))
+        else:
+             # Just append to the last one if it's very short, or make a final one
+             txt_blocks[-1][1].extend(current_block_words)
 
     if not all_words:
         print("No words found in transcription.")
