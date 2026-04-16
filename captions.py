@@ -3,8 +3,8 @@ captions.py — unified caption tool
 
 Commands:
   transcribe  <audio.mp3> [--language de] [--model large-v3-turbo]
-  apply-edits <audio.json> <edited_client.txt>
-  from-srt    <captions.srt>
+  to-premiere <edited_transcript.txt>
+  apply-edits <audio.json> <edited_plain.txt>
 """
 
 import difflib
@@ -26,6 +26,14 @@ def seconds_to_hms(seconds):
     return f"{h}:{m:02d}:{s:02d}"
 
 
+def seconds_to_srt_timestamp(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def fix_icloud_path(path):
     if "comappleCloudDocs" in path:
         return path.replace("comappleCloudDocs", "com~apple~CloudDocs")
@@ -36,7 +44,7 @@ def make_word_obj(text, start, duration, confidence=1.0):
     is_eos = text.rstrip().endswith(('.', '?', '!', ','))
     return {
         "confidence": round(confidence, 3),
-        "duration": round(max(duration, 0.001), 3),
+        "duration": round(max(duration, 0.08), 3),
         "eos": is_eos,
         "start": round(start, 3),
         "tags": [],
@@ -112,8 +120,6 @@ def cmd_transcribe(args):
     parser.add_argument("--premiere-language", default="en-us", dest="premiere_language",
                         help="Language tag written into Premiere JSON (default: en-us)")
     parser.add_argument("-o", "--output", help="Optional output path for the JSON/TXT (defaults to same folder as audio)")
-    parser.add_argument("--timestamp-interval", type=float, default=60.0, dest="timestamp_interval",
-                        help="Frequency of timestamps in the TXT file (default: every 60 seconds)")
     opts = parser.parse_args(args)
 
     try:
@@ -145,46 +151,29 @@ def cmd_transcribe(args):
 
     speaker_id = str(uuid.uuid4())
     all_words = []
-    txt_blocks = []  # list of (timestamp_str, list_of_words)
-    
-    last_ts_time = -9999.0  # Force first block to have a timestamp
-    current_block_words = []
+    srt_blocks = []  # list of (index, start_ts, end_ts, text)
 
     with tqdm(total=round(_info.duration, 2), unit="sec", desc="Transcribing") as pbar:
-        for seg in segments_iter:
+        for idx, seg in enumerate(segments_iter, 1):
             raw_words = list(seg.words)
             if not raw_words:
                 continue
 
+            seg_text_parts = []
             for w in raw_words:
                 text = w.word.strip()
                 if not text:
                     continue
                 word_obj = make_word_obj(text, w.start, w.end - w.start, confidence=w.probability)
                 all_words.append(word_obj)
-                current_block_words.append(text)
+                seg_text_parts.append(text)
 
-            # Grouping for minimal TXT timestamps
-            if seg.start - last_ts_time >= opts.timestamp_interval:
-                if current_block_words:
-                    txt_blocks.append((seconds_to_hms(seg.start), current_block_words))
-                    current_block_words = []
-                else:
-                    # If empty but need a start time for the first block
-                    pass
-                last_ts_time = seg.start
+            if seg_text_parts:
+                start_ts = seconds_to_srt_timestamp(seg.start)
+                end_ts = seconds_to_srt_timestamp(seg.end)
+                srt_blocks.append((idx, start_ts, end_ts, " ".join(seg_text_parts)))
             
             pbar.update(round(seg.end - pbar.n, 2))
-
-    # Catch remaining words for the last block
-    if current_block_words:
-        # If the first block hasn't been added yet
-        ts = txt_blocks[-1][0] if txt_blocks else "0:00:00"
-        if not txt_blocks:
-             txt_blocks.append(("0:00:00", current_block_words))
-        else:
-             # Just append to the last one if it's very short, or make a final one
-             txt_blocks[-1][1].extend(current_block_words)
 
     if not all_words:
         print("No words found in transcription.")
@@ -214,16 +203,17 @@ def cmd_transcribe(args):
 
     print(f"Wrote {final_json_path}  ({len(all_words)} words, {len(segments)} segments)")
 
-    # Prepare client TXT lines
+    # Prepare client TXT lines in SRT format
     txt_lines = []
-    for ts, words in txt_blocks:
-        txt_lines.append(f"[{ts}]")
-        txt_lines.append(" ".join(words))
+    for idx, start_ts, end_ts, text in srt_blocks:
+        txt_lines.append(str(idx))
+        txt_lines.append(f"{start_ts} --> {end_ts}")
+        txt_lines.append(text)
         txt_lines.append("")
         
     # Write client TXT to the SAME final location
     with open(final_txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(txt_lines).rstrip() + "\n")
+        f.write("\n".join(txt_lines).rstrip() + "\n\n")
     print(f"Wrote {final_txt_path}")
 
 
@@ -320,21 +310,21 @@ def cmd_apply_edits(args):
 # from-srt
 # ---------------------------------------------------------------------------
 
-def cmd_from_srt(args):
+def cmd_to_premiere(args):
     import argparse
-    parser = argparse.ArgumentParser(prog="captions.py from-srt")
-    parser.add_argument("srt_file", help="Path to SRT file")
-    parser.add_argument("-o", "--output", help="Optional output path for the JSON (defaults to same folder as SRT)")
+    parser = argparse.ArgumentParser(prog="captions.py to-premiere")
+    parser.add_argument("transcript_file", help="Path to edited TXT or SRT file")
+    parser.add_argument("-o", "--output", help="Optional output path for the JSON (defaults to same folder as input)")
     opts = parser.parse_args(args)
 
-    srt_path = fix_icloud_path(opts.srt_file)
-    output_path = opts.output if opts.output else os.path.splitext(srt_path)[0] + ".json"
+    input_path = fix_icloud_path(opts.transcript_file)
+    output_path = opts.output if opts.output else os.path.splitext(input_path)[0] + ".json"
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from srt_to_json import parse_srt, convert_to_premiere_json
 
-    print(f"Converting {srt_path} → {output_path} …")
-    srt_entries = parse_srt(srt_path)
+    print(f"Converting {input_path} → {output_path} …")
+    srt_entries = parse_srt(input_path)
     premiere_json = convert_to_premiere_json(srt_entries)
     
     try:
@@ -357,7 +347,8 @@ def cmd_from_srt(args):
 COMMANDS = {
     "transcribe": cmd_transcribe,
     "apply-edits": cmd_apply_edits,
-    "from-srt": cmd_from_srt,
+    "to-premiere": cmd_to_premiere,
+    "from-srt": cmd_to_premiere,  # Legacy alias
 }
 
 if __name__ == "__main__":
@@ -365,8 +356,8 @@ if __name__ == "__main__":
         print(__doc__)
         print("Commands:")
         print("  transcribe  <audio.mp3> [--language de] [--model large-v3-turbo]")
-        print("  apply-edits <audio.json> <edited_client.txt>")
-        print("  from-srt    <captions.srt>")
+        print("  to-premiere <edited_transcript.txt>")
+        print("  apply-edits <audio.json> <edited_plain.txt>")
         sys.exit(1)
 
     COMMANDS[sys.argv[1]](sys.argv[2:])
