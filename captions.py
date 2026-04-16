@@ -147,6 +147,8 @@ def cmd_transcribe(args):
         audio_path,
         language=opts.language,
         word_timestamps=True,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
     )
 
     speaker_id = str(uuid.uuid4())
