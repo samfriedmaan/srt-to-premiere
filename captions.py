@@ -114,9 +114,12 @@ def cmd_transcribe(args):
     parser = argparse.ArgumentParser(prog="captions.py transcribe")
     parser.add_argument("audio", help="Path to MP3 (or any audio) file")
     parser.add_argument("--language", default="de", help="Whisper language code (default: de)")
-    parser.add_argument("--model", default="large-v3-turbo", help="Whisper model name (default: large-v3-turbo)")
-    parser.add_argument("--compute-type", default="float32", dest="compute_type",
-                        help="Whisper compute type (default: float32 for stability on Mac)")
+    parser.add_argument("--model", default="nebi/whisper-large-v3-turbo-swiss-german-ct2-int8",
+                        help="Whisper model name or HuggingFace repo ID (default: Swiss German fine-tuned ct2 model)")
+    parser.add_argument("--compute-type", default="int8", dest="compute_type",
+                        help="Whisper compute type (default: int8, matches Swiss German ct2 model quantization)")
+    parser.add_argument("--prompt", default="Schweizerdeutsch. Transkription auf Hochdeutsch.",
+                        help="Initial prompt to prime the model (default: Swiss German context)")
     parser.add_argument("--premiere-language", default="en-us", dest="premiere_language",
                         help="Language tag written into Premiere JSON (default: en-us)")
     parser.add_argument("-o", "--output", help="Optional output path for the JSON/TXT (defaults to same folder as audio)")
@@ -142,40 +145,58 @@ def cmd_transcribe(args):
     print(f"Loading model '{opts.model}' (compute_type={opts.compute_type}) …")
     model = WhisperModel(opts.model, device="auto", compute_type=opts.compute_type)
 
-    print(f"Transcribing {audio_path}  (language={opts.language}) …")
+    print(f"Transcribing {audio_path}  (language={opts.language}, prompt={opts.prompt!r}) …")
     segments_iter, _info = model.transcribe(
         audio_path,
         language=opts.language,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
+        initial_prompt=opts.prompt,
+        condition_on_previous_text=False,
     )
 
     speaker_id = str(uuid.uuid4())
     all_words = []
-    srt_blocks = []  # list of (index, start_ts, end_ts, text)
 
     with tqdm(total=round(_info.duration, 2), unit="sec", desc="Transcribing") as pbar:
-        for idx, seg in enumerate(segments_iter, 1):
+        for seg in segments_iter:
             raw_words = list(seg.words)
             if not raw_words:
                 continue
 
-            seg_text_parts = []
             for w in raw_words:
                 text = w.word.strip()
                 if not text:
                     continue
                 word_obj = make_word_obj(text, w.start, w.end - w.start, confidence=w.probability)
                 all_words.append(word_obj)
-                seg_text_parts.append(text)
 
-            if seg_text_parts:
-                start_ts = seconds_to_srt_timestamp(seg.start)
-                end_ts = seconds_to_srt_timestamp(seg.end)
-                srt_blocks.append((idx, start_ts, end_ts, " ".join(seg_text_parts)))
-            
             pbar.update(round(seg.end - pbar.n, 2))
+
+    # Build sentence-level SRT blocks from word timestamps.
+    # Split at sentence-ending punctuation; cap at MAX_WORDS_PER_BLOCK as a safety valve.
+    MAX_WORDS_PER_BLOCK = 30
+    srt_blocks = []
+    bucket = []
+
+    def flush_bucket(bucket, idx):
+        if not bucket:
+            return idx
+        start_ts = seconds_to_srt_timestamp(bucket[0]["start"])
+        end_ts = seconds_to_srt_timestamp(bucket[-1]["start"] + bucket[-1]["duration"])
+        srt_blocks.append((idx, start_ts, end_ts, " ".join(w["text"] for w in bucket)))
+        return idx + 1
+
+    srt_idx = 1
+    for word_obj in all_words:
+        bucket.append(word_obj)
+        is_sentence_end = word_obj["text"].rstrip().endswith(('.', '?', '!'))
+        if is_sentence_end or len(bucket) >= MAX_WORDS_PER_BLOCK:
+            srt_idx = flush_bucket(bucket, srt_idx)
+            bucket = []
+
+    srt_idx = flush_bucket(bucket, srt_idx)  # flush any trailing words
 
     if not all_words:
         print("No words found in transcription.")
