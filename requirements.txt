@@ -1,3 +1,5 @@
 faster-whisper
 huggingface_hub
 tqdm
+nvidia-cublas-cu12; platform_system == "Windows"
+nvidia-cudnn-cu12; platform_system == "Windows"

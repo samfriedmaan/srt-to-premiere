@@ -14,6 +14,26 @@ import re
 import sys
 import uuid
 
+# Dynamically locate and load CUDA/cuDNN DLLs on Windows (from nvidia-* pip packages)
+if os.name == "nt":
+    import site
+    try:
+        site_dirs = sys.path + site.getsitepackages() + [site.getusersitepackages()]
+    except Exception:
+        site_dirs = sys.path
+    seen_dirs = set()
+    for s_dir in site_dirs:
+        if not s_dir or s_dir in seen_dirs:
+            continue
+        seen_dirs.add(s_dir)
+        for pkg in ["cublas", "cudnn"]:
+            cuda_path = os.path.join(s_dir, "nvidia", pkg, "bin")
+            if os.path.exists(cuda_path):
+                try:
+                    os.add_dll_directory(cuda_path)
+                except Exception:
+                    pass
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -118,6 +138,7 @@ def cmd_transcribe(args):
                         help="Whisper model name or HuggingFace repo ID (default: Swiss German fine-tuned ct2 model)")
     parser.add_argument("--compute-type", default="int8", dest="compute_type",
                         help="Whisper compute type (default: int8, matches Swiss German ct2 model quantization)")
+    parser.add_argument("--device", default="auto", help="Device to use: cpu, cuda, or auto (default: auto)")
     parser.add_argument("--prompt", default="Schweizerdeutsch. Transkription auf Hochdeutsch.",
                         help="Initial prompt to prime the model (default: Swiss German context)")
     parser.add_argument("--premiere-language", default="en-us", dest="premiere_language",
@@ -142,37 +163,85 @@ def cmd_transcribe(args):
         json_path = os.path.join(opts.output, os.path.basename(base) + ".json")
         txt_path = os.path.join(opts.output, os.path.basename(base) + "_client.txt")
 
-    print(f"Loading model '{opts.model}' (compute_type={opts.compute_type}) …")
-    model = WhisperModel(opts.model, device="auto", compute_type=opts.compute_type)
+    import platform
+    system_os = platform.system()
+    machine_arch = platform.machine()
+    selected_device = opts.device
+
+    if opts.device == "auto":
+        if system_os == "Darwin":
+            if machine_arch == "arm64":
+                print("[System Info] Apple Silicon M-series detected. Running optimized CPU mode (using Apple Accelerate/ARM64).")
+            else:
+                print("[System Info] macOS detected. Running on CPU.")
+            selected_device = "cpu"
+        else:
+            try:
+                import ctranslate2
+                cuda_devices = ctranslate2.get_cuda_device_count()
+            except Exception:
+                cuda_devices = 0
+
+            if cuda_devices > 0:
+                print(f"[System Info] NVIDIA GPU detected ({cuda_devices} device(s)). Attempting CUDA execution...")
+                selected_device = "cuda"
+            else:
+                print("[System Info] No NVIDIA GPU/CUDA support detected. Running on CPU.")
+                selected_device = "cpu"
+    else:
+        print(f"[System Info] Explicitly using device: {opts.device}")
+
+    print(f"Loading model '{opts.model}' (compute_type={opts.compute_type}, device={selected_device}) …")
+    model = WhisperModel(opts.model, device=selected_device, compute_type=opts.compute_type)
 
     print(f"Transcribing {audio_path}  (language={opts.language}, prompt={opts.prompt!r}) …")
-    segments_iter, _info = model.transcribe(
-        audio_path,
-        language=opts.language,
-        word_timestamps=True,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-        initial_prompt=opts.prompt,
-        condition_on_previous_text=False,
-    )
 
-    speaker_id = str(uuid.uuid4())
-    all_words = []
+    def run_transcription(whisper_model):
+        segments_iter, _info = whisper_model.transcribe(
+            audio_path,
+            language=opts.language,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            initial_prompt=opts.prompt,
+            condition_on_previous_text=False,
+        )
 
-    with tqdm(total=round(_info.duration, 2), unit="sec", desc="Transcribing") as pbar:
-        for seg in segments_iter:
-            raw_words = list(seg.words)
-            if not raw_words:
-                continue
+        speaker_id = str(uuid.uuid4())
+        all_words = []
 
-            for w in raw_words:
-                text = w.word.strip()
-                if not text:
+        with tqdm(total=round(_info.duration, 2), unit="sec", desc="Transcribing") as pbar:
+            for seg in segments_iter:
+                raw_words = list(seg.words)
+                if not raw_words:
                     continue
-                word_obj = make_word_obj(text, w.start, w.end - w.start, confidence=w.probability)
-                all_words.append(word_obj)
 
-            pbar.update(round(seg.end - pbar.n, 2))
+                for w in raw_words:
+                    text = w.word.strip()
+                    if not text:
+                        continue
+                    word_obj = make_word_obj(text, w.start, w.end - w.start, confidence=w.probability)
+                    all_words.append(word_obj)
+
+                pbar.update(round(seg.end - pbar.n, 2))
+        return all_words, speaker_id
+
+    try:
+        all_words, speaker_id = run_transcription(model)
+    except RuntimeError as e:
+        err_msg = str(e).lower()
+        if selected_device != "cpu" and any(x in err_msg for x in ["cublas", "cudnn", "cuda", "library not found"]):
+            print(f"\nCUDA/GPU transcription failed: {e}")
+            print("Attempting automatic fallback to CPU mode...")
+            cpu_compute_type = opts.compute_type
+            if cpu_compute_type == "float16":
+                cpu_compute_type = "int8"
+            
+            print(f"Reloading model '{opts.model}' on CPU (compute_type={cpu_compute_type}) …")
+            model = WhisperModel(opts.model, device="cpu", compute_type=cpu_compute_type)
+            all_words, speaker_id = run_transcription(model)
+        else:
+            raise
 
     # Build sentence-level SRT blocks from word timestamps.
     # Split at sentence-ending punctuation; cap at MAX_WORDS_PER_BLOCK as a safety valve.
