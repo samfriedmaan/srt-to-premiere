@@ -20,3 +20,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Python / uv
+.venv/
+venv/
+*.pyc
