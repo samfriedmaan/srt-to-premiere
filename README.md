@@ -1,6 +1,6 @@
 # SRT to Premiere Pro Unified Tooling
 
-A Python toolset for transcribing Swiss German audio and generating Premiere Pro-ready JSON transcripts. Features a client-review workflow for correcting errors before final import.
+A Python toolset for transcribing Swiss German audio and generating Premiere Pro-ready JSON transcripts. It also converts existing SRT files, frame-based timeline caption exports, WebVTT-style files, and compatible JSON transcript/cue files.
 
 ## Workflow
 
@@ -12,7 +12,7 @@ A Python toolset for transcribing Swiss German audio and generating Premiere Pro
 
 2. **Edit**: Send `interview_client.txt` to the client. They correct errors in the SRT-style text.
 
-3. **Convert**: Turn the corrected transcript into a Premiere-ready JSON.
+3. **Convert**: Turn the corrected transcript into a Premiere-ready JSON. The converter accepts SRT, VTT, frame-based timeline text, and JSON.
    ```bash
    python3 captions.py to-premiere interview_client_edited.txt
    ```
@@ -81,13 +81,48 @@ python3 captions.py transcribe <audio.mp3> [options]
 
 ### `to-premiere`
 
-Convert an edited `.txt` or `.srt` file into a Premiere Pro JSON.
+Convert a timestamped input into Premiere Pro's word-timed transcript JSON. No extra dependencies are needed; this command uses the Python standard library only.
 
 ```bash
-python3 captions.py to-premiere <transcript.txt> [-o output.json]
+python3 captions.py to-premiere INPUT [-o OUTPUT.json]
 ```
 
-No extra dependencies needed — standard library only.
+Supported inputs:
+
+- Standard SRT timestamps such as `00:00:01,200 --> 00:00:03,400`
+- WebVTT-style millisecond timestamps
+- Frame-based timeline timestamps such as `00:00:01:12 - 00:00:03:05`
+- Premiere transcript JSON (`language`, `segments`, `speakers`, and word arrays)
+- Simple JSON arrays/objects containing `start`, `end`, and `text`
+
+For cue-level inputs, the converter evenly distributes each cue's duration across its words. This creates the word-level timing Premiere requires, but it is necessarily an estimate unless the source already has word timestamps.
+
+Options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--premiere-language` | Input JSON language or `en-us` | Premiere language metadata, e.g. `de-de` |
+| `--fps` | Auto / 30 | Frame rate for `HH:MM:SS:FF` inputs; supports 24, 25, 30, 50, 60, and other numeric rates |
+| `--overlap-policy` | `sequential` | Clip earlier cues when timings overlap; use `preserve` to keep overlaps |
+| `--speaker-name` | `Speaker 1` | Speaker name for timestamped text without speaker labels |
+
+Examples:
+
+```bash
+# Standard SRT
+python3 captions.py to-premiere captions.srt -o transcript.json --premiere-language de-de
+
+# Premiere/timeline text with HH:MM:SS:FF ranges
+python3 captions.py to-premiere timeline.txt -o transcript.json --fps 30 --premiere-language de-de
+
+# European 25 fps timeline
+python3 captions.py to-premiere timeline.txt -o transcript.json --fps 25 --premiere-language de-de
+
+# Existing Premiere JSON; preserve its language and speaker metadata
+python3 captions.py to-premiere existing-transcript.json -o normalized.json
+```
+
+Timeline exports may include `Speaker 1` lines. Those lines become speaker metadata rather than transcript text. Empty cues are ignored. With the default `sequential` policy, an overlap is resolved by ending the earlier cue at the later cue's start; if two cues start together, the later cue wins. The command reports clips and dropped cues so the normalization is visible.
 
 ### `apply-edits`
 
@@ -110,3 +145,11 @@ tqdm
 Install: `pip install faster-whisper huggingface_hub tqdm`
 
 Python 3.8+ required. `to-premiere` and `apply-edits` need no extra packages.
+
+## Tests
+
+Run the standard-library regression tests with:
+
+```bash
+python3 -m unittest -v test_transcript_io.py
+```

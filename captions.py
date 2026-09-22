@@ -3,7 +3,7 @@ captions.py — unified caption tool
 
 Commands:
   transcribe  <audio.mp3> [--language de] [--model large-v3-turbo]
-  to-premiere <edited_transcript.txt>
+  to-premiere <transcript.srt|timeline.txt|transcript.json>
   apply-edits <audio.json> <edited_plain.txt>
 """
 
@@ -13,6 +13,9 @@ import os
 import re
 import sys
 import uuid
+from pathlib import Path
+
+from transcript_io import Cue, convert_cues, convert_file, parse_srt
 
 # Dynamically locate and load CUDA/cuDNN DLLs on Windows (from nvidia-* pip packages)
 if os.name == "nt":
@@ -399,99 +402,96 @@ def cmd_apply_edits(args):
 
 
 # ---------------------------------------------------------------------------
-# from-srt
+# to-premiere / from-srt
 # ---------------------------------------------------------------------------
 
-def srt_time_to_seconds(srt_time):
-    """Converts SRT/Transcript timestamp (HH:MM:SS[:/.,]mmm) to float seconds."""
-    match = re.match(r"(\d{2}):(\d{2}):(\d{2})[:,\.](\d{2,3})", srt_time)
-    if not match:
-        return 0.0
-    h, m, s, ms_str = match.groups()
-    h, m, s = map(int, [h, m, s])
-    ms_val = int(ms_str)
-    if len(ms_str) == 2:
-        ms_val *= 10
-    return h * 3600 + m * 60 + s + ms_val / 1000.0
-
-
-def parse_srt(srt_file_path):
-    """Parses SRT or timestamped TXT file and returns a list of dictionaries with start, end, and text."""
-    with open(srt_file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    ts_pattern = re.compile(r"(\d{2}:\d{2}:\d{2}[:,\.]\d{2,3})\s*(?:-->|-)\s*(\d{2}:\d{2}:\d{2}[:,\.]\d{2,3})")
-    
-    entries = []
-    parts = ts_pattern.split(content)
-    
-    for i in range(1, len(parts), 3):
-        start = srt_time_to_seconds(parts[i])
-        end = srt_time_to_seconds(parts[i+1])
-        text_raw = parts[i+2]
-        
-        lines = [line.strip() for line in text_raw.split('\n') if line.strip()]
-        if lines and lines[-1].isdigit():
-            lines.pop()
-            
-        text = " ".join(lines).strip()
-        if text:
-            entries.append({"start": start, "end": end, "text": text})
-    return entries
-
-
-def convert_to_premiere_json(srt_entries):
-    """Converts parsed SRT entries to Premiere Pro JSON structure."""
-    speaker_id = str(uuid.uuid4())
-    all_words = []
-    MIN_WORD_DURATION = 0.08
-    
-    for entry in srt_entries:
-        words_in_block = entry['text'].split()
-        if not words_in_block: continue
-        block_duration = entry['end'] - entry['start']
-        word_duration = max(block_duration / len(words_in_block), MIN_WORD_DURATION)
-        
-        for i, word_text in enumerate(words_in_block):
-            word_start = entry['start'] + (i * word_duration)
-            all_words.append(make_word_obj(word_text, word_start, word_duration))
-
-    return {
-        "language": "en-us",
-        "segments": words_to_segments(all_words, speaker_id, "en-us"),
-        "speakers": [{"id": speaker_id, "name": "Speaker 1"}]
-    }
+def convert_to_premiere_json(srt_entries, language="en-us", overlap_policy="sequential"):
+    """Backward-compatible conversion for callers that already parsed cues."""
+    cues = [
+        Cue(item["start"], item["end"], item["text"], item.get("speaker"), index)
+        for index, item in enumerate(srt_entries)
+    ]
+    return convert_cues(cues, language=language, overlap_policy=overlap_policy)
 
 
 def cmd_to_premiere(args):
     import argparse
-    parser = argparse.ArgumentParser(prog="captions.py to-premiere")
-    parser.add_argument("transcript_file", help="Path to edited TXT or SRT file")
-    parser.add_argument("-o", "--output", help="Optional output path for the JSON (defaults to same folder as input)")
+
+    parser = argparse.ArgumentParser(
+        prog="captions.py to-premiere",
+        description="Convert SRT, VTT, frame-based timeline text, or JSON to Premiere transcript JSON.",
+    )
+    parser.add_argument("transcript_file", help="Input SRT/VTT/TXT/JSON file")
+    parser.add_argument("-o", "--output", help="Output JSON path or directory")
+    parser.add_argument(
+        "--premiere-language",
+        default=None,
+        help="Language metadata, e.g. de-de. JSON inputs keep their existing language by default.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Frame rate for HH:MM:SS:FF inputs (including European 25 fps); auto-detects 60 when needed, otherwise defaults to 30.",
+    )
+    parser.add_argument(
+        "--overlap-policy",
+        choices=("sequential", "preserve"),
+        default="sequential",
+        help="Resolve overlaps by clipping earlier text (default), or preserve them.",
+    )
+    parser.add_argument("--speaker-name", help="Speaker name for timestamped text without speaker labels")
     opts = parser.parse_args(args)
 
-    input_path = fix_icloud_path(opts.transcript_file)
-    output_path = opts.output if opts.output else os.path.splitext(input_path)[0] + ".json"
+    input_path = Path(fix_icloud_path(opts.transcript_file))
+    if opts.output:
+        requested_output = Path(fix_icloud_path(opts.output))
+        is_directory = requested_output.is_dir() or opts.output.endswith(os.sep)
+        output_path = requested_output / f"{input_path.stem}.json" if is_directory else requested_output
+    else:
+        output_path = input_path.with_suffix(".json")
 
     print(f"Converting {input_path} → {output_path} …")
-    srt_entries = parse_srt(input_path)
-    if not srt_entries:
-        print(f"Error: No timestamps found in {input_path}. Check the format.")
-        sys.exit(1)
-        
-    premiere_json = convert_to_premiere_json(srt_entries)
-    
     try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(premiere_json, f, separators=(",", ":"))
+        premiere_json, report = convert_file(
+            input_path,
+            language=opts.premiere_language,
+            fps=opts.fps,
+            overlap_policy=opts.overlap_policy,
+            speaker_name=opts.speaker_name,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(2)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.write_text(
+            json.dumps(premiere_json, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         final_path = output_path
     except PermissionError:
-        final_path = os.path.basename(output_path)
-        print(f"Warning: Permission denied for {output_path}. Saving to current directory.")
-        with open(final_path, "w", encoding="utf-8") as f:
-            json.dump(premiere_json, f, separators=(",", ":"))
-            
-    print(f"Done. Saved to {final_path}")
+        final_path = Path(output_path.name)
+        print(f"Warning: Permission denied for {output_path}. Saving to current directory as {final_path}")
+        final_path.write_text(
+            json.dumps(premiere_json, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    word_count = sum(len(segment["words"]) for segment in premiere_json["segments"])
+    details = [
+        f"format={report.format_name}",
+        f"{len(premiere_json['segments'])} segments",
+        f"{word_count} words",
+    ]
+    if report.fps:
+        details.append(f"fps={report.fps:g}")
+    if report.overlaps_clipped:
+        details.append(f"{report.overlaps_clipped} overlaps clipped")
+    if report.entries_dropped:
+        details.append(f"{report.entries_dropped} entries dropped")
+    print(f"Done. Saved to {final_path} ({', '.join(details)})")
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +510,7 @@ if __name__ == "__main__":
         print(__doc__)
         print("Commands:")
         print("  transcribe  <audio.mp3> [--language de] [--model large-v3-turbo]")
-        print("  to-premiere <edited_transcript.txt>")
+        print("  to-premiere <transcript.srt|timeline.txt|transcript.json>")
         print("  apply-edits <audio.json> <edited_plain.txt>")
         sys.exit(1)
 
