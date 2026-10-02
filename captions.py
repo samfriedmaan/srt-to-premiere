@@ -2,7 +2,8 @@
 captions.py — unified caption tool
 
 Commands:
-  transcribe  <audio.mp3> [--language de] [--model large-v3-turbo]
+  transcribe  <audio-or-video> [--model large-v3-turbo]
+  models      [--model large-v3-turbo]
   to-premiere <transcript.srt|timeline.txt|transcript.json>
   apply-edits <audio.json> <edited_plain.txt>
 """
@@ -133,183 +134,13 @@ def write_premiere_json(segments, speaker_id, premiere_language, output_path):
 # ---------------------------------------------------------------------------
 
 def cmd_transcribe(args):
-    import argparse
-    parser = argparse.ArgumentParser(prog="captions.py transcribe")
-    parser.add_argument("audio", help="Path to MP3 (or any audio) file")
-    parser.add_argument("--language", default="de", help="Whisper language code (default: de)")
-    parser.add_argument("--model", default="nebi/whisper-large-v3-turbo-swiss-german-ct2-int8",
-                        help="Whisper model name or HuggingFace repo ID (default: Swiss German fine-tuned ct2 model)")
-    parser.add_argument("--compute-type", default="int8", dest="compute_type",
-                        help="Whisper compute type (default: int8, matches Swiss German ct2 model quantization)")
-    parser.add_argument("--device", default="auto", help="Device to use: cpu, cuda, or auto (default: auto)")
-    parser.add_argument("--prompt", default="Schweizerdeutsch. Transkription auf Hochdeutsch.",
-                        help="Initial prompt to prime the model (default: Swiss German context)")
-    parser.add_argument("--premiere-language", default="en-us", dest="premiere_language",
-                        help="Language tag written into Premiere JSON (default: en-us)")
-    parser.add_argument("-o", "--output", help="Optional output path for the JSON/TXT (defaults to same folder as audio)")
-    opts = parser.parse_args(args)
+    from transcribe_cli import cmd_transcribe as transcribe
+    transcribe(args)
 
-    try:
-        from faster_whisper import WhisperModel
-        from tqdm import tqdm
-    except ImportError:
-        print("Required libraries missing. Run:  pip install faster-whisper tqdm")
-        sys.exit(1)
 
-    audio_path = fix_icloud_path(opts.audio)
-    base = os.path.splitext(audio_path)[0]
-    
-    # Initial target paths
-    json_path = opts.output if opts.output and opts.output.lower().endswith(".json") else base + ".json"
-    txt_path = json_path.replace(".json", "_client.txt") if json_path.endswith(".json") else base + "_client.txt"
-    if opts.output and not opts.output.lower().endswith(".json"):
-        json_path = os.path.join(opts.output, os.path.basename(base) + ".json")
-        txt_path = os.path.join(opts.output, os.path.basename(base) + "_client.txt")
-
-    import platform
-    system_os = platform.system()
-    machine_arch = platform.machine()
-    selected_device = opts.device
-
-    if opts.device == "auto":
-        if system_os == "Darwin":
-            if machine_arch == "arm64":
-                print("[System Info] Apple Silicon M-series detected. Running optimized CPU mode (using Apple Accelerate/ARM64).")
-            else:
-                print("[System Info] macOS detected. Running on CPU.")
-            selected_device = "cpu"
-        else:
-            try:
-                import ctranslate2
-                cuda_devices = ctranslate2.get_cuda_device_count()
-            except Exception:
-                cuda_devices = 0
-
-            if cuda_devices > 0:
-                print(f"[System Info] NVIDIA GPU detected ({cuda_devices} device(s)). Attempting CUDA execution...")
-                selected_device = "cuda"
-            else:
-                print("[System Info] No NVIDIA GPU/CUDA support detected. Running on CPU.")
-                selected_device = "cpu"
-    else:
-        print(f"[System Info] Explicitly using device: {opts.device}")
-
-    print(f"Loading model '{opts.model}' (compute_type={opts.compute_type}, device={selected_device}) …")
-    model = WhisperModel(opts.model, device=selected_device, compute_type=opts.compute_type)
-
-    print(f"Transcribing {audio_path}  (language={opts.language}, prompt={opts.prompt!r}) …")
-
-    def run_transcription(whisper_model):
-        segments_iter, _info = whisper_model.transcribe(
-            audio_path,
-            language=opts.language,
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            initial_prompt=opts.prompt,
-            condition_on_previous_text=False,
-        )
-
-        speaker_id = str(uuid.uuid4())
-        all_words = []
-
-        with tqdm(total=round(_info.duration, 2), unit="sec", desc="Transcribing") as pbar:
-            for seg in segments_iter:
-                raw_words = list(seg.words)
-                if not raw_words:
-                    continue
-
-                for w in raw_words:
-                    text = w.word.strip()
-                    if not text:
-                        continue
-                    word_obj = make_word_obj(text, w.start, w.end - w.start, confidence=w.probability)
-                    all_words.append(word_obj)
-
-                pbar.update(round(seg.end - pbar.n, 2))
-        return all_words, speaker_id
-
-    try:
-        all_words, speaker_id = run_transcription(model)
-    except RuntimeError as e:
-        err_msg = str(e).lower()
-        if selected_device != "cpu" and any(x in err_msg for x in ["cublas", "cudnn", "cuda", "library not found"]):
-            print(f"\nCUDA/GPU transcription failed: {e}")
-            print("Attempting automatic fallback to CPU mode...")
-            cpu_compute_type = opts.compute_type
-            if cpu_compute_type == "float16":
-                cpu_compute_type = "int8"
-            
-            print(f"Reloading model '{opts.model}' on CPU (compute_type={cpu_compute_type}) …")
-            model = WhisperModel(opts.model, device="cpu", compute_type=cpu_compute_type)
-            all_words, speaker_id = run_transcription(model)
-        else:
-            raise
-
-    # Build sentence-level SRT blocks from word timestamps.
-    # Split at sentence-ending punctuation; cap at MAX_WORDS_PER_BLOCK as a safety valve.
-    MAX_WORDS_PER_BLOCK = 30
-    srt_blocks = []
-    bucket = []
-
-    def flush_bucket(bucket, idx):
-        if not bucket:
-            return idx
-        start_ts = seconds_to_srt_timestamp(bucket[0]["start"])
-        end_ts = seconds_to_srt_timestamp(bucket[-1]["start"] + bucket[-1]["duration"])
-        srt_blocks.append((idx, start_ts, end_ts, " ".join(w["text"] for w in bucket)))
-        return idx + 1
-
-    srt_idx = 1
-    for word_obj in all_words:
-        bucket.append(word_obj)
-        is_sentence_end = word_obj["text"].rstrip().endswith(('.', '?', '!'))
-        if is_sentence_end or len(bucket) >= MAX_WORDS_PER_BLOCK:
-            srt_idx = flush_bucket(bucket, srt_idx)
-            bucket = []
-
-    srt_idx = flush_bucket(bucket, srt_idx)  # flush any trailing words
-
-    if not all_words:
-        print("No words found in transcription.")
-        sys.exit(1)
-
-    # Write Premiere JSON
-    segments = words_to_segments(all_words, speaker_id, opts.premiere_language)
-    
-    data = {
-        "language": opts.premiere_language,
-        "segments": segments,
-        "speakers": [{"id": speaker_id, "name": "Speaker 1"}],
-    }
-    
-    # Try writing JSON first to determine the target directory
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, separators=(",", ":"))
-        final_json_path = json_path
-        final_txt_path = txt_path
-    except PermissionError:
-        final_json_path = os.path.basename(json_path)
-        final_txt_path = os.path.basename(txt_path)
-        print(f"Warning: Permission denied for {json_path}. Saving BOTH files to current directory.")
-        with open(final_json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, separators=(",", ":"))
-
-    print(f"Wrote {final_json_path}  ({len(all_words)} words, {len(segments)} segments)")
-
-    # Prepare client TXT lines in SRT format
-    txt_lines = []
-    for idx, start_ts, end_ts, text in srt_blocks:
-        txt_lines.append(str(idx))
-        txt_lines.append(f"{start_ts} --> {end_ts}")
-        txt_lines.append(text)
-        txt_lines.append("")
-        
-    # Write client TXT to the SAME final location
-    with open(final_txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(txt_lines).rstrip() + "\n\n")
-    print(f"Wrote {final_txt_path}")
+def cmd_models(args):
+    from transcribe_cli import cmd_models as models
+    models(args)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +333,7 @@ def cmd_to_premiere(args):
 
 COMMANDS = {
     "transcribe": cmd_transcribe,
+    "models": cmd_models,
     "apply-edits": cmd_apply_edits,
     "to-premiere": cmd_to_premiere,
     "from-srt": cmd_to_premiere,  # Legacy alias
@@ -511,7 +343,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         print("Commands:")
-        print("  transcribe  <audio.mp3> [--language de] [--model large-v3-turbo]")
+        print("  transcribe  <audio-or-video> [--model large-v3-turbo]")
+        print("  models      [--model large-v3-turbo]")
         print("  to-premiere <transcript.srt|timeline.txt|transcript.json>")
         print("  apply-edits <audio.json> <edited_plain.txt>")
         sys.exit(1)
