@@ -14,7 +14,7 @@ approximation; true word timing can only come from a word-timed source.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import re
 import uuid
@@ -24,7 +24,6 @@ from typing import Any, Iterable
 
 DEFAULT_LANGUAGE = "en-us"
 DEFAULT_FPS = 30.0
-MIN_SYNTHETIC_WORD_DURATION = 0.001
 MAX_WORDS_PER_SEGMENT = 15
 
 TIMECODE = r"\d{1,3}:\d{2}:\d{2}(?::\d{1,3}|[,.]\d{1,3})?"
@@ -34,6 +33,7 @@ TIMESTAMP_LINE_RE = re.compile(
 )
 SPEAKER_LINE_RE = re.compile(r"^\s*(?:speaker|spk)\s*[:#-]?\s*(.+?)\s*$", re.IGNORECASE)
 MARKUP_RE = re.compile(r"</?(?:i|b|u|font)(?:\s[^>]*)?>", re.IGNORECASE)
+CUE_NUMBER_RE = re.compile(r"(?:^|\n)[ \t]*\d+[ \t]*\r?\n\Z")
 
 
 @dataclass
@@ -52,6 +52,7 @@ class ParseReport:
     entries_dropped: int = 0
     overlaps_clipped: int = 0
     fps: float | None = None
+    zero_duration_words: int = 0
 
 
 def _timecode_has_frames(value: str) -> bool:
@@ -112,9 +113,6 @@ def _clean_cue_text(raw_body: str) -> tuple[str, str | None]:
     for line in lines:
         if not line:
             continue
-        if line.isdigit():
-            # SRT cue numbers sit between one timestamp block and the next.
-            continue
         speaker_match = SPEAKER_LINE_RE.fullmatch(line)
         if speaker_match and speaker is None:
             speaker_value = speaker_match.group(1).strip()
@@ -135,16 +133,26 @@ def parse_timestamped_text(content: str, fps: float | None = None) -> tuple[list
     frame_based = any(_timecode_has_frames(value) for value in timestamp_values)
     entries: list[Cue] = []
     dropped = 0
+    numbered_input = bool(CUE_NUMBER_RE.search(content[:matches[0].start()]))
 
     for index, match in enumerate(matches):
         body_end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        if index + 1 < len(matches):
+            # Remove only the next cue's header number, never numeric speech.
+            # Numbered SRT can omit blank separators; unnumbered timeline/VTT
+            # text may itself end in a number immediately before a timestamp.
+            raw_body = content[match.end():body_end]
+            next_number = CUE_NUMBER_RE.search(raw_body)
+            separated_header = next_number is not None and raw_body[:next_number.start()].endswith(("\n", "\r"))
+            if next_number and (numbered_input or separated_header):
+                body_end = match.end() + next_number.start()
         text, speaker = _clean_cue_text(content[match.end() : body_end])
         if not text:
             dropped += 1
             continue
         start = parse_timecode(match.group("start"), effective_fps)
         end = parse_timecode(match.group("end"), effective_fps)
-        if end <= start:
+        if end < start:
             dropped += 1
             continue
         entries.append(Cue(start, end, text, speaker=speaker, source_index=index))
@@ -168,7 +176,8 @@ def resolve_cue_overlaps(cues: list[Cue], policy: str = "sequential") -> tuple[l
     """Resolve overlapping cues while preserving their source order.
 
     ``sequential`` clips the earlier cue at the next cue's start. If two cues
-    start together, the later cue wins and the earlier cue is dropped. This is
+    start together, the later positive-duration cue wins. Zero-duration cues
+    are retained in source order without clipping other cues. This is
     the safest behavior for transcript import because Premiere gets one
     unambiguous text sequence instead of simultaneous words.
     """
@@ -179,24 +188,27 @@ def resolve_cue_overlaps(cues: list[Cue], policy: str = "sequential") -> tuple[l
         return ordered, 0, 0
 
     resolved: list[Cue] = []
+    last_positive_index: int | None = None
     clipped = 0
     dropped = 0
-    for cue in ordered:
-        if cue.end <= cue.start:
+    for source_cue in ordered:
+        cue = replace(source_cue)
+        if cue.end < cue.start:
             dropped += 1
             continue
-        if resolved and cue.start < resolved[-1].end:
-            previous = resolved[-1]
+        if cue.end == cue.start:
+            resolved.append(cue)
+            continue
+        if last_positive_index is not None and cue.start < resolved[last_positive_index].end:
+            previous = resolved[last_positive_index]
             if cue.start <= previous.start:
-                resolved.pop()
+                resolved.pop(last_positive_index)
                 dropped += 1
             else:
                 previous.end = cue.start
                 clipped += 1
-        if cue.end > cue.start:
-            resolved.append(cue)
-        else:
-            dropped += 1
+        resolved.append(cue)
+        last_positive_index = len(resolved) - 1
     return resolved, clipped, dropped
 
 
@@ -237,7 +249,7 @@ def cues_to_words(cues: list[Cue], speaker_ids: dict[str, str], default_speaker:
                 text,
                 cue.start + (index * duration),
                 duration,
-                minimum_duration=MIN_SYNTHETIC_WORD_DURATION,
+                minimum_duration=0.0,
             )
             word["_speaker"] = speaker_id
             words.append(word)
@@ -248,7 +260,7 @@ def _flush_segment(segments: list[dict[str, Any]], current: list[dict[str, Any]]
     if not current:
         return
     start = current[0]["start"]
-    end = current[-1]["start"] + current[-1]["duration"]
+    end = max(word["start"] + word["duration"] for word in current)
     speaker = current[0].get("_speaker")
     clean_words = []
     for word in current:
@@ -291,27 +303,29 @@ def _normalize_words(words: list[dict[str, Any]], overlap_policy: str) -> tuple[
         raise ValueError("overlap policy must be 'sequential' or 'preserve'")
 
     result: list[dict[str, Any]] = []
+    last_positive_index: int | None = None
     clipped = 0
     dropped = 0
     for _, source_word in ordered:
         word = dict(source_word)
         word_end = word["start"] + word["duration"]
-        if word_end <= word["start"]:
+        if word_end < word["start"]:
             dropped += 1
             continue
-        if result:
-            previous = result[-1]
+        if word_end == word["start"]:
+            result.append(word)
+            continue
+        if last_positive_index is not None:
+            previous = result[last_positive_index]
             previous_end = previous["start"] + previous["duration"]
             if word["start"] <= previous["start"] + 1e-6:
-                result.pop()
+                result.pop(last_positive_index)
                 dropped += 1
             elif word["start"] < previous_end - 0.0011:
-                previous["duration"] = round(word["start"] - previous["start"], 3)
+                previous["duration"] = word["start"] - previous["start"]
                 clipped += 1
-        if word["duration"] > 0:
-            result.append(word)
-        else:
-            dropped += 1
+        result.append(word)
+        last_positive_index = len(result) - 1
     return result, clipped, dropped
 
 
@@ -333,6 +347,7 @@ def _premiere_data_from_json(data: Any, language_override: str | None, overlap_p
             entries_read=len(data["segments"]),
             entries_dropped=dropped,
             overlaps_clipped=clipped,
+            zero_duration_words=sum(word["duration"] == 0 for word in words),
         )
 
     if isinstance(data, dict):
@@ -371,6 +386,7 @@ def _convert_cues(cues: list[Cue], language: str, overlap_policy: str, format_na
         entries_read=len(cues),
         entries_dropped=dropped,
         overlaps_clipped=clipped,
+        zero_duration_words=sum(word["duration"] == 0 for word in words),
     )
 
 

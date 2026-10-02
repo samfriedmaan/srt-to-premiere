@@ -491,6 +491,8 @@ def cmd_to_premiere(args):
         details.append(f"{report.overlaps_clipped} overlaps clipped")
     if report.entries_dropped:
         details.append(f"{report.entries_dropped} entries dropped")
+    if report.zero_duration_words:
+        details.append(f"{report.zero_duration_words} zero-duration words retained (source timing)")
     print(f"Done. Saved to {final_path} ({', '.join(details)})")
 
 

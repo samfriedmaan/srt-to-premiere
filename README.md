@@ -1,87 +1,25 @@
-# SRT to Premiere Pro Unified Tooling
+# Anything to Premiere Transcript
 
-A Python toolset for transcribing Swiss German audio and generating Premiere Pro-ready JSON transcripts. It also converts existing SRT files, frame-based timeline caption exports, WebVTT-style files, and compatible JSON transcript/cue files.
+A Python converter for turning existing timestamped transcripts into Premiere Pro's word-timed JSON format. The main command is `to-premiere`; supported sources include SRT, frame-based timeline caption exports, WebVTT-style files, and compatible JSON transcript/cue files.
 
-## Workflow
-
-1. **Transcribe**: Convert audio to a Premiere JSON and a human-readable SRT-style transcript.
-   ```bash
-   python3 captions.py transcribe interview.mp3
-   ```
-   *Generates `interview.json` and `interview_client.txt`.*
-
-2. **Edit**: Send `interview_client.txt` to the client. They correct errors in the SRT-style text.
-
-3. **Convert**: Turn the corrected transcript into a Premiere-ready JSON. The converter accepts SRT, VTT, frame-based timeline text, and JSON.
-   ```bash
-   python3 captions.py to-premiere interview_client_edited.txt
-   ```
-   *Generates `interview_client_edited.json` ready for import.*
-
----
-
-## Setup (new machine)
-
-### 1. Install Python dependencies
+## Quick start
 
 ```bash
-pip install faster-whisper huggingface_hub tqdm
+python3 captions.py to-premiere transcript.srt -o transcript.json
 ```
 
-### 2. Download the Swiss German model (first transcription only)
+Import the resulting JSON as a transcript in Premiere. Conversion uses only the Python standard library; no model download or transcription dependencies are needed.
 
-The fine-tuned Swiss German model downloads automatically on first use — no manual step required. It's ~800 MB and is cached locally so subsequent runs are instant.
+### Word-level timing
 
-**Cache location:** `~/.cache/huggingface/hub/models--nebi--whisper-large-v3-turbo-swiss-german-ct2-int8/`
+- **One word per SRT cue:** each word keeps its supplied start and end time, including short words and gaps between words. Numeric speech such as `100` is retained.
+- **Zero-duration words:** words with identical start and end timestamps are retained in source order, including several words at the same timestamp. The command reports their count. These words have no measured duration in the source; the converter does not invent one. Adobe's [transcript schema](https://github.com/AdobeDocs/uxp-premiere-pro-samples/blob/main/sample-panels/premiere-api/assets/transcript_format_spec.json) permits zero-duration words and segments.
+- **Several words per cue:** the cue's duration is evenly distributed across its words. These word times are estimates.
+- **Premiere transcript JSON:** existing word timings, confidence, tags, and speaker metadata are retained, subject to the selected overlap policy.
 
-**To pre-download explicitly** (e.g. before going offline):
-```bash
-python3 -c "from huggingface_hub import snapshot_download; snapshot_download('nebi/whisper-large-v3-turbo-swiss-german-ct2-int8')"
-```
+The converter does not recover precise word timings from plain text or sentence-level timestamps. Accurate timing requires a source that already contains word timestamps.
 
-**To copy the model from an existing machine** (avoids re-downloading):
-```bash
-# On the source machine, find the cache:
-ls ~/.cache/huggingface/hub/models--nebi--whisper-large-v3-turbo-swiss-german-ct2-int8/
-
-# Copy the entire folder to the same path on the new machine.
-rsync -av ~/.cache/huggingface/hub/models--nebi--whisper-large-v3-turbo-swiss-german-ct2-int8/ \
-  user@other-machine:~/.cache/huggingface/hub/models--nebi--whisper-large-v3-turbo-swiss-german-ct2-int8/
-```
-
-### 3. Verify
-
-```bash
-python3 captions.py transcribe some_audio.mp3
-```
-
----
-
-## Commands
-
-### `transcribe`
-
-Transcribe audio using the Swiss German fine-tuned Whisper model.
-
-```bash
-python3 captions.py transcribe <audio.mp3> [options]
-```
-
-| Option | Default | Description |
-|---|---|---|
-| `--model` | `nebi/whisper-large-v3-turbo-swiss-german-ct2-int8` | Model name or HuggingFace repo ID |
-| `--language` | `de` | Whisper language code |
-| `--compute-type` | `int8` | Quantization type (`int8`, `float16`, `float32`) |
-| `--prompt` | `Schweizerdeutsch. Transkription auf Hochdeutsch.` | Initial prompt to prime the model |
-| `-o` / `--output` | Same folder as audio | Output path for JSON (TXT is placed alongside it) |
-
-**About the model:** `nebi/whisper-large-v3-turbo-swiss-german-ct2-int8` is a CTranslate2-format version of `Flurin17/whisper-large-v3-turbo-swiss-german`, fine-tuned on the SwissDial-ZH and STT4SG-350 datasets (343+ hours of Swiss German speech from ZHAW/ETH Zurich). It outputs Standard German text from Swiss German speech. The `--language de` flag is correct — passing `gsw` is not supported by Whisper.
-
-**Performance on Apple Silicon (M1/M4):** faster-whisper uses CPU only (no MPS/Metal support). Expect roughly real-time speed (~1–1.5× audio duration) on M-series chips.
-
-### `to-premiere`
-
-Convert a timestamped input into Premiere Pro's word-timed transcript JSON. No extra dependencies are needed; this command uses the Python standard library only.
+## `to-premiere`
 
 ```bash
 python3 captions.py to-premiere INPUT [-o OUTPUT.json]
@@ -94,8 +32,6 @@ Supported inputs:
 - Frame-based timeline timestamps such as `00:00:01:12 - 00:00:03:05`
 - Premiere transcript JSON (`language`, `segments`, `speakers`, and word arrays)
 - Simple JSON arrays/objects containing `start`, `end`, and `text`
-
-For cue-level inputs, the converter evenly distributes each cue's duration across its words. This creates the word-level timing Premiere requires, but it is necessarily an estimate unless the source already has word timestamps.
 
 Options:
 
@@ -122,7 +58,36 @@ python3 captions.py to-premiere timeline.txt -o transcript.json --fps 25 --premi
 python3 captions.py to-premiere existing-transcript.json -o normalized.json
 ```
 
-Timeline exports may include `Speaker 1` lines. Those lines become speaker metadata rather than transcript text. Empty cues are ignored. With the default `sequential` policy, an overlap is resolved by ending the earlier cue at the later cue's start; if two cues start together, the later cue wins. The command reports clips and dropped cues so the normalization is visible.
+Timeline exports may include `Speaker 1` lines. Those lines become speaker metadata rather than transcript text. Empty cues and reversed time ranges are ignored. With the default `sequential` policy, an overlap is resolved by ending the earlier cue at the later cue's start; if two positive-duration cues start together, the later cue wins. Zero-duration cues are retained without clipping other cues. Use `--overlap-policy preserve` to keep overlapping positive-duration timings unchanged. The command reports clips, dropped cues, and retained zero-duration words so the normalization is visible.
+
+## Legacy audio transcription and editing
+
+The original `transcribe`, `apply-edits`, and `from-srt` commands remain available. `from-srt` is an alias for `to-premiere`.
+
+### `transcribe`
+
+Transcribe audio using the Swiss German fine-tuned Whisper model. Install its optional dependencies first:
+
+```bash
+pip install faster-whisper huggingface_hub tqdm
+python3 captions.py transcribe interview.mp3
+```
+
+Generates `interview.json` with word timing and `interview_client.txt` with SRT-style text for editing. Convert an edited timestamped TXT file using `to-premiere`; this estimates timing within each edited cue.
+
+| Option | Default | Description |
+|---|---|---|
+| `--model` | `nebi/whisper-large-v3-turbo-swiss-german-ct2-int8` | Model name or HuggingFace repo ID |
+| `--language` | `de` | Whisper language code |
+| `--compute-type` | `int8` | Quantization type (`int8`, `float16`, `float32`) |
+| `--prompt` | `Schweizerdeutsch. Transkription auf Hochdeutsch.` | Initial prompt to prime the model |
+| `-o` / `--output` | Same folder as audio | Output path for JSON (TXT is placed alongside it) |
+
+The model downloads automatically on first use and is cached in `~/.cache/huggingface/hub/models--nebi--whisper-large-v3-turbo-swiss-german-ct2-int8/`. To pre-download:
+
+```bash
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('nebi/whisper-large-v3-turbo-swiss-german-ct2-int8')"
+```
 
 ### `apply-edits`
 
@@ -134,17 +99,7 @@ python3 captions.py apply-edits <original.json> <edited.txt>
 
 ---
 
-## Requirements
-
-```
-faster-whisper
-huggingface_hub
-tqdm
-```
-
-Install: `pip install faster-whisper huggingface_hub tqdm`
-
-Python 3.8+ required. `to-premiere` and `apply-edits` need no extra packages.
+`to-premiere` and `apply-edits` need no extra packages. The full `uv` project specifies Python 3.14+ for the transcription dependency environment.
 
 ## Tests
 
